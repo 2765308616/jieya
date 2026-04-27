@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>搓泡泡 · 解压神器</title>
+<style>
+*{margin:0;padding:0}
+html,body{width:100%;height:100%;overflow:hidden}
+body{background:#1a1028;cursor:crosshair;user-select:none;-webkit-user-select:none;touch-action:none}
+canvas{position:fixed;inset:0;display:block}
+#combo{
+  position:fixed;top:28px;left:50%;transform:translateX(-50%);
+  font:700 2.2rem Georgia,serif;color:#fff;
+  text-shadow:0 0 30px rgba(255,150,200,0.8),0 0 60px rgba(150,100,255,0.4);
+  pointer-events:none;opacity:0;transition:opacity 0.25s;z-index:10;
+}
+#combo.visible{opacity:1}
+#hint{
+  position:fixed;bottom:32px;left:50%;transform:translateX(-50%);
+  font:15px system-ui,sans-serif;color:rgba(255,255,255,0.35);letter-spacing:0.5px;
+  pointer-events:none;z-index:10;
+  animation:hintOut 3s 3s ease-out forwards;
+}
+@keyframes hintOut{to{opacity:0}}
+#pop-count{
+  position:fixed;top:28px;right:32px;
+  font:13px system-ui,sans-serif;color:rgba(255,255,255,0.3);
+  pointer-events:none;z-index:10;
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="combo"></div>
+<div id="hint">点击或滑动 · 开始解压</div>
+<div id="pop-count"></div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const comboEl = document.getElementById('combo');
+const popCountEl = document.getElementById('pop-count');
+let W, H, dpr;
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── Colors ──
+const COLORS = [
+  ['#ff6b9d','#ff3d7f','#ffa3c4'],['#ff9a3c','#ff7a0a','#ffc176'],
+  ['#ffd93d','#ffc107','#ffe87a'],['#6bcb77','#3fa84c','#a3e0a8'],
+  ['#4ecdc4','#2ba8a0','#85e0db'],['#5b9bff','#2e75e0','#94bfff'],
+  ['#a78bfa','#7c5cd6','#c4b1fb'],['#f06292','#e0355a','#f48fb1'],
+  ['#ff5252','#e02020','#ff8a8a'],['#26d0a8','#0fa583','#6eddc1'],
+  ['#9c27ff','#7c0fd6','#bf6dff'],['#00bcd4','#0095a8','#5fd5e3'],
+  ['#ffb6b9','#ff8a8e','#ffd1d3'],['#c9e4ca','#9bc99e','#dceedd'],
+  ['#bde0fe','#7fbdf3','#d8edff'],['#ffafcc','#ff7eb3','#ffcfdd'],
+  ['#cdb4db','#b08ec5','#e0cee8'],['#fdcb6e','#f0b429','#fee9a0'],
+  ['#e17055','#d35030','#eda18d'],['#74b9ff','#4b93e0','#a8d1ff'],
+];
+
+// ── Pre-render bubble textures to offscreen canvases ──
+const BUBBLE_CACHE = new Map();
+function getBubbleTexture(colorIdx, radius) {
+  const key = colorIdx + '|' + radius;
+  if (BUBBLE_CACHE.has(key)) return BUBBLE_CACHE.get(key);
+  const sz = (radius * 2 + 4) * 2;
+  const off = document.createElement('canvas');
+  off.width = sz; off.height = sz;
+  const ox = off.getContext('2d');
+  const r = radius;
+  const cx = sz / 2, cy = sz / 2;
+  const [fill, dark, light] = COLORS[colorIdx];
+
+  // Outer glow
+  const glow = ox.createRadialGradient(cx, cy, r * 0.8, cx, cy, r * 1.3);
+  glow.addColorStop(0, fill + '30');
+  glow.addColorStop(1, 'transparent');
+  ox.fillStyle = glow;
+  ox.beginPath(); ox.arc(cx, cy, r * 1.3, 0, Math.PI * 2); ox.fill();
+
+  // Main body
+  const grad = ox.createRadialGradient(cx - r * 0.2, cy - r * 0.25, r * 0.05, cx, cy, r);
+  grad.addColorStop(0, 'rgba(255,255,255,0.85)');
+  grad.addColorStop(0.15, 'rgba(255,255,255,0.35)');
+  grad.addColorStop(0.4, fill + 'cc');
+  grad.addColorStop(0.75, light + 'aa');
+  grad.addColorStop(1, dark + '60');
+  ox.fillStyle = grad;
+  ox.beginPath(); ox.arc(cx, cy, r, 0, Math.PI * 2); ox.fill();
+
+  // Specular highlight
+  ox.save();
+  ox.globalAlpha = 0.6;
+  const spec = ox.createRadialGradient(cx - r * 0.28, cy - r * 0.3, r * 0.02, cx - r * 0.15, cy - r * 0.15, r * 0.45);
+  spec.addColorStop(0, '#ffffffcc');
+  spec.addColorStop(0.6, '#ffffff44');
+  spec.addColorStop(1, 'transparent');
+  ox.fillStyle = spec;
+  ox.beginPath(); ox.arc(cx, cy, r, 0, Math.PI * 2); ox.fill();
+  ox.restore();
+
+  // Rim light at bottom
+  ox.save();
+  ox.globalAlpha = 0.2;
+  const rim = ox.createRadialGradient(cx + r * 0.2, cy + r * 0.35, r * 0.01, cx, cy + r * 0.1, r * 0.6);
+  rim.addColorStop(0, '#ffffff88');
+  rim.addColorStop(1, 'transparent');
+  ox.fillStyle = rim;
+  ox.beginPath(); ox.arc(cx, cy, r, 0, Math.PI * 2); ox.fill();
+  ox.restore();
+
+  if (BUBBLE_CACHE.size > 300) {
+    const first = BUBBLE_CACHE.keys().next().value;
+    BUBBLE_CACHE.delete(first);
+  }
+  BUBBLE_CACHE.set(key, off);
+  return off;
+}
+
+// ── Audio ──
+const SFX = (() => {
+  let ac = null;
+  function init() { if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)(); }
+  function pop(sn) {
+    if (!ac) return;
+    const t = ac.currentTime;
+    const len = 0.09 + sn * 0.05;
+    const n = Math.floor(ac.sampleRate * len);
+    const buf = ac.createBuffer(1, n, ac.sampleRate);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) ch[i] = Math.random() * 2 - 1;
+    const s = ac.createBufferSource(); s.buffer = buf;
+    const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 900 - sn * 550; bp.Q.value = 2;
+    const g = ac.createGain(); g.gain.setValueAtTime(0.55, t); g.gain.exponentialRampToValueAtTime(0.001, t + len);
+    const o = ac.createOscillator(); o.frequency.value = 420 - sn * 260;
+    const og = ac.createGain(); og.gain.setValueAtTime(0.4, t); og.gain.exponentialRampToValueAtTime(0.001, t + 0.03);
+    o.connect(og).connect(ac.destination); o.start(t); o.stop(t + 0.03);
+    s.connect(bp).connect(g).connect(ac.destination); s.start(t);
+  }
+  function chime() {
+    if (!ac) return;
+    const t = ac.currentTime;
+    [520, 780].forEach(f => {
+      const o = ac.createOscillator(); o.frequency.value = f; o.type = 'sine';
+      const g = ac.createGain(); g.gain.setValueAtTime(0.2, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+      o.connect(g).connect(ac.destination); o.start(t); o.stop(t + 0.25);
+    });
+  }
+  return { init, pop, chime };
+})();
+
+// ── Bubbles ──
+const TARGET = 120;
+const bubbles = [];
+function rand(a, b) { return a + Math.random() * (b - a); }
+
+function makeBubble(onScreen) {
+  const tier = Math.random();
+  const r = tier < 0.3 ? rand(35, 55) : tier < 0.7 ? rand(55, 90) : rand(90, 125);
+  const sn = (r - 35) / (125 - 35);
+  const ci = Math.floor(Math.random() * COLORS.length);
+  let x, y;
+  if (onScreen) {
+    x = rand(r, W - r); y = rand(r, H - r);
+  } else {
+    const e = Math.floor(Math.random() * 4);
+    if (e === 0) { x = rand(r, W - r); y = -r * 2; }
+    else if (e === 1) { x = W + r * 2; y = rand(r, H - r); }
+    else if (e === 2) { x = rand(r, W - r); y = H + r * 2; }
+    else { x = -r * 2; y = rand(r, H - r); }
+  }
+  const sp = (0.25 + Math.random() * 0.45) * (1 - sn * 0.4);
+  const a = Math.random() * Math.PI * 2;
+  const wobPhase = Math.random() * Math.PI * 2;
+  bubbles.push({
+    x, y, r, sn, ci, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+    wobPhase, wobSpeed: 1.5 + Math.random() * 1.5, alive: true,
+    scale: 1, popTime: 0
+  });
+}
+
+// ── Particles ──
+const particles = [];
+function emitShards(cx, cy, r, ci) {
+  const [fill, , light] = COLORS[ci];
+  const count = 8 + Math.floor(r / 15);
+  for (let i = 0; i < count; i++) {
+    const a = (Math.PI * 2 / count) * i + Math.random() * 0.5;
+    const speed = r * (0.015 + Math.random() * 0.02);
+    const sz = r * (0.08 + Math.random() * 0.12);
+    particles.push({
+      x: cx, y: cy, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed - 0.5,
+      sz, life: 1, decay: 0.015 + Math.random() * 0.01,
+      color: Math.random() > 0.5 ? fill : light,
+      rot: Math.random() * Math.PI * 2, rotV: (Math.random() - 0.5) * 0.15,
+      gravity: 0.04
+    });
+  }
+}
+
+// ── Rings ──
+const rings = [];
+function emitRing(cx, cy, color) {
+  rings.push({ x: cx, y: cy, r: 5, maxR: 140, life: 1, color });
+}
+
+// ── Glows ──
+const glows = [];
+function emitGlow(cx, cy, color) {
+  glows.push({ x: cx, y: cy, r: 10, maxR: 100, life: 1, color });
+}
+
+// ── Score floats ──
+const floats = [];
+function emitFloat(cx, cy, text) {
+  floats.push({ x: cx, y: cy, text, life: 1 });
+}
+
+// ── Trail ──
+let swiping = false;
+const trail = [];
+
+// ── Combo ──
+let combo = 0, comboTimer = null, totalPops = 0;
+function comboHit(cx, cy) {
+  combo++; totalPops++;
+  popCountEl.textContent = totalPops + ' pops';
+  clearTimeout(comboTimer);
+  if (combo >= 3) {
+    comboEl.textContent = combo >= 10 ? 'MEGA ×' + combo : '×' + combo + ' COMBO';
+    comboEl.classList.add('visible');
+    emitFloat(cx, cy, '+' + combo);
+    if (combo % 5 === 0) SFX.chime();
+  }
+  comboTimer = setTimeout(() => { combo = 0; comboEl.classList.remove('visible'); }, 1200);
+}
+
+function popBubble(b, px, py) {
+  if (!b.alive) return;
+  b.alive = false;
+  b.popTime = performance.now();
+  b.scale = 1;
+  SFX.pop(b.sn);
+  const cx = px != null ? px : b.x, cy = py != null ? py : b.y;
+  emitShards(cx, cy, b.r, b.ci);
+  emitRing(cx, cy, COLORS[b.ci][0]);
+  emitGlow(cx, cy, COLORS[b.ci][0]);
+  comboHit(cx, cy);
+}
+
+// ── Pointer events ──
+function ptDown(x, y) {
+  SFX.init();
+  swiping = true;
+  trail.length = 0;
+  trail.push({ x, y, t: performance.now() });
+  hitTest(x, y);
+}
+function ptMove(x, y) {
+  if (!swiping) return;
+  trail.push({ x, y, t: performance.now() });
+  if (trail.length > 50) trail.shift();
+  hitTest(x, y);
+}
+function ptUp() { swiping = false; }
+
+function hitTest(x, y) {
+  for (const b of bubbles) {
+    if (!b.alive) continue;
+    const dx = x - b.x, dy = y - b.y;
+    if (dx * dx + dy * dy < b.r * b.r) popBubble(b, x, y);
+  }
+}
+
+document.addEventListener('pointerdown', e => ptDown(e.clientX, e.clientY));
+document.addEventListener('pointermove', e => ptMove(e.clientX, e.clientY));
+document.addEventListener('pointerup', ptUp);
+document.addEventListener('pointercancel', ptUp);
+
+// ── Background gradient (drawn once, cached) ──
+let bgCanvas = null;
+function drawBgCached() {
+  if (bgCanvas && bgCanvas.width === canvas.width && bgCanvas.height === canvas.height) return bgCanvas;
+  bgCanvas = document.createElement('canvas');
+  bgCanvas.width = canvas.width; bgCanvas.height = canvas.height;
+  const bx = bgCanvas.getContext('2d');
+  bx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // Dark base
+  bx.fillStyle = '#1a1028';
+  bx.fillRect(0, 0, W, H);
+  // Soft color spots
+  const spots = [
+    [W * 0.2, H * 0.2, Math.max(W, H) * 0.5, '#2a1040', '#1a1028'],
+    [W * 0.8, H * 0.8, Math.max(W, H) * 0.5, '#102030', '#1a1028'],
+    [W * 0.5, H * 0.5, Math.max(W, H) * 0.6, '#201535', '#1a1028'],
+  ];
+  for (const [sx, sy, sr, c1, c2] of spots) {
+    const g = bx.createRadialGradient(sx, sy, 0, sx, sy, sr);
+    g.addColorStop(0, c1); g.addColorStop(1, c2);
+    bx.fillStyle = g;
+    bx.fillRect(0, 0, W, H);
+  }
+  return bgCanvas;
+}
+
+// ── Main Loop ──
+const now = performance.now;
+let lastResize = 0;
+
+function tick(t) {
+  // Detect resize
+  if (W !== window.innerWidth || H !== window.innerHeight) {
+    resize();
+    bgCanvas = null;
+  }
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Background
+  const bg = drawBgCached();
+  ctx.drawImage(bg, 0, 0, W, H);
+
+  // Update & draw bubbles
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    if (!b.alive) {
+      const elapsed = t - b.popTime;
+      if (elapsed > 200) {
+        bubbles.splice(i, 1);
+        makeBubble(false);
+      } else {
+        const p = elapsed / 200;
+        b.scale = 1 + p * 0.4;
+        const alpha = 1 - p;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        const tex = getBubbleTexture(b.ci, Math.round(b.r));
+        const sz = b.r * 2 * b.scale;
+        ctx.drawImage(tex, b.x - sz / 2 - 2 * b.scale, b.y - sz / 2 - 2 * b.scale,
+          (b.r * 2 + 4) * 2 * b.scale / 2, (b.r * 2 + 4) * 2 * b.scale / 2);
+        ctx.restore();
+      }
+      continue;
+    }
+
+    b.x += b.vx; b.y += b.vy;
+    if (b.x - b.r < 0) { b.x = b.r; b.vx = Math.abs(b.vx); }
+    if (b.x + b.r > W) { b.x = W - b.r; b.vx = -Math.abs(b.vx); }
+    if (b.y - b.r < 0) { b.y = b.r; b.vy = Math.abs(b.vy); }
+    if (b.y + b.r > H) { b.y = H - b.r; b.vy = -Math.abs(b.vy); }
+
+    // Wobble
+    b.wobPhase += 0.016 * b.wobSpeed;
+    const wob = 1 + Math.sin(b.wobPhase) * 0.03;
+
+    const tex = getBubbleTexture(b.ci, Math.round(b.r));
+    const drawSz = (b.r * 2 + 4) * wob;
+    ctx.drawImage(tex, b.x - drawSz / 2, b.y - drawSz / 2, drawSz, drawSz);
+  }
+
+  // Particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy; p.vy += p.gravity;
+    p.vx *= 0.98; p.life -= p.decay;
+    p.rot += p.rotV;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    ctx.save();
+    ctx.globalAlpha = p.life * 0.9;
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    const s = p.sz * (0.3 + p.life * 0.7);
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, s, s * 0.7, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Rings
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const rn = rings[i];
+    rn.life -= 0.025;
+    rn.r += (rn.maxR - rn.r) * 0.08;
+    if (rn.life <= 0) { rings.splice(i, 1); continue; }
+    ctx.save();
+    ctx.globalAlpha = rn.life * 0.6;
+    ctx.strokeStyle = rn.color;
+    ctx.lineWidth = Math.max(0.5, rn.life * 2.5);
+    ctx.beginPath(); ctx.arc(rn.x, rn.y, rn.r, 0, Math.PI * 2); ctx.stroke();
+    ctx.restore();
+  }
+
+  // Glows
+  for (let i = glows.length - 1; i >= 0; i--) {
+    const g = glows[i];
+    g.life -= 0.03;
+    g.r += (g.maxR - g.r) * 0.06;
+    if (g.life <= 0) { glows.splice(i, 1); continue; }
+    ctx.save();
+    ctx.globalAlpha = g.life * 0.35;
+    const gr = ctx.createRadialGradient(g.x, g.y, 0, g.x, g.y, g.r);
+    gr.addColorStop(0, g.color + '80');
+    gr.addColorStop(1, 'transparent');
+    ctx.fillStyle = gr;
+    ctx.beginPath(); ctx.arc(g.x, g.y, g.r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  // Score floats
+  for (let i = floats.length - 1; i >= 0; i--) {
+    const f = floats[i];
+    f.life -= 0.018;
+    f.y -= 0.8;
+    if (f.life <= 0) { floats.splice(i, 1); continue; }
+    ctx.save();
+    ctx.globalAlpha = f.life;
+    ctx.fillStyle = '#fff';
+    ctx.font = '700 18px Georgia,serif';
+    ctx.textAlign = 'center';
+    ctx.shadowColor = 'rgba(255,150,255,0.6)';
+    ctx.shadowBlur = 12;
+    ctx.fillText(f.text, f.x, f.y);
+    ctx.restore();
+  }
+
+  // Trail
+  const tn = performance.now();
+  while (trail.length > 0 && tn - trail[0].t > 250) trail.shift();
+  if (trail.length >= 2) {
+    for (let i = 1; i < trail.length; i++) {
+      const age = (tn - trail[i].t) / 250;
+      const alpha = Math.max(0, (1 - age) * 0.6);
+      const w = Math.max(1, (1 - age) * 5);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = '#ff6b9d';
+      ctx.lineWidth = w;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(trail[i - 1].x, trail[i - 1].y);
+      ctx.lineTo(trail[i].x, trail[i].y);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  requestAnimationFrame(tick);
+}
+
+// ── Init ──
+for (let i = 0; i < TARGET; i++) makeBubble(true);
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
